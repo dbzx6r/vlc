@@ -64,7 +64,7 @@ static int Mouse( filter_t *, vlc_mouse_t *, const vlc_mouse_t *, const vlc_mous
 
 /* */
 static void DrawZoomStatus( plane_t *, video_orientation_t,
-                            int i_offset_x, int i_offset_y, bool b_visible );
+                            int scale, int top, bool b_visible );
 static void DrawRectangle( uint8_t *, int i_pitch, int i_width, int i_height,
                            int x, int y, int i_w, int i_h );
 
@@ -113,6 +113,28 @@ static void Plot(plane_t *p, video_orientation_t o, int x, int y, uint8_t value)
 static int PreviewSize(int size)
 {
     return (size / VIS_ZOOM) & ~1;
+}
+
+/* Keep stock proportions for a 720-line picture. For larger pictures
+ * scale with the upright height, just like the quarter-frame preview. */
+#define UI_BASE 720
+static int ControlScale(int width, int height)
+{
+    return __MAX(UI_BASE, __MIN(height, (int64_t)width * UI_BASE / 80));
+}
+
+static int CellEdge(int n, int scale)
+{
+    return ((int64_t)n * scale + UI_BASE - 1) / UI_BASE;
+}
+
+static void PlotCell(plane_t *plane, video_orientation_t orient, int scale,
+                     int top, int x, int y, uint8_t value)
+{
+    int right = CellEdge(x + 1, scale), bottom = CellEdge(y + 1, scale);
+    for (int py = CellEdge(y, scale); py < bottom; ++py)
+        for (int px = CellEdge(x, scale); px < right; ++px)
+            Plot(plane, orient, px, top + py, value);
 }
 
 static int GaugeWidth(int row)
@@ -261,8 +283,8 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
 
         /* image visualization */
         fmt_out = p_filter->fmt_out.video;
-        fmt_out.i_width  = fmt_out.i_visible_width  = (fmt_out.i_visible_width /VIS_ZOOM) & ~1;
-        fmt_out.i_height = fmt_out.i_visible_height = (fmt_out.i_visible_height/VIS_ZOOM) & ~1;
+        fmt_out.i_width  = fmt_out.i_visible_width  = PreviewSize(fmt_out.i_visible_width);
+        fmt_out.i_height = fmt_out.i_visible_height = PreviewSize(fmt_out.i_visible_height);
         p_converted = image_Convert( p_sys->p_image, p_pic,
                                      &p_pic->format, &fmt_out );
         if (unlikely(!p_converted))
@@ -300,18 +322,20 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
                        v_w, v_h );
 
         /* */
-        v_h = (ORIENT_IS_SWAP(orient) ? fmt_out.i_visible_width : fmt_out.i_visible_height) + 1;
+        v_h = (ORIENT_IS_SWAP(orient) ? fmt_out.i_visible_width : fmt_out.i_visible_height);
     }
     else
     {
-        v_h = 1;
+        v_h = 0;
     }
 
-    /* print a small "VLC ZOOM" */
+    const int w = p_filter->fmt_out.video.i_visible_width;
+    const int h = p_filter->fmt_out.video.i_visible_height;
+    const int scale = ORIENT_IS_SWAP(orient) ? ControlScale(h, w) : ControlScale(w, h);
 
     if( b_visible || p_sys->i_last_activity + p_sys->i_hide_timeout > mdate() )
         DrawZoomStatus( p_oyp, orient,
-                        1, v_h, b_visible );
+                        scale, v_h, b_visible );
 
     if( b_visible )
     {
@@ -319,7 +343,7 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
         for (int row = 0; row <= 80; ++row) {
             int width = GaugeWidth(row);
             for (int x = 0; x <= width; ++x)
-                Plot(p_oyp, orient, x, v_h + 8 + row,
+                PlotCell(p_oyp, orient, scale, v_h, x, 9 + row,
                      x == 0 || x == width || row == 0 ? 128 :
                      (GaugeZoom(row) <= o_zoom ? 235 : 16));
         }
@@ -329,7 +353,7 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
 }
 
 static void DrawZoomStatus( plane_t *plane, video_orientation_t orient,
-                            int i_offset_x, int i_offset_y, bool b_visible )
+                            int scale, int top, bool b_visible )
 {
     static const char *p_hide =
         "X   X X      XXXX   XXXXX  XXX   XXX  XX XX   X   X XXXXX XXXX  XXXXXL"
@@ -345,11 +369,11 @@ static void DrawZoomStatus( plane_t *plane, video_orientation_t orient,
         "  X   XXXXX  XXXX   XXXXX  XXX   XXX  X   X   XXXX  X   X  XXX   X X L";
     const char *p_draw = b_visible ? p_hide : p_show;
 
-    for( int i = 0, x = i_offset_x, y = i_offset_y; p_draw[i] != '\0'; i++ )
+    for( int i = 0, x = 1, y = 1; p_draw[i] != '\0'; i++ )
     {
         if( p_draw[i] == 'X' )
         {
-            Plot(plane, orient, x, y, 235);
+            PlotCell(plane, orient, scale, top, x, y, 235);
             x++;
         }
         else if( p_draw[i] == ' ' )
@@ -358,7 +382,7 @@ static void DrawZoomStatus( plane_t *plane, video_orientation_t orient,
         }
         else if( p_draw[i] == 'L' )
         {
-            x = i_offset_x;
+            x = 1;
             y++;
         }
     }
@@ -404,6 +428,12 @@ static int Mouse( filter_t *p_filter, vlc_mouse_t *p_mouse, const vlc_mouse_t *p
     const int mx = ORIENT_IS_SWAP(orient) ? ry : rx;
     const int my = ORIENT_IS_SWAP(orient) ? rx : ry;
 
+    const int scale = ORIENT_IS_SWAP(orient) ? ControlScale(h, w) : ControlScale(w, h);
+    const int top = p_sys->b_visible ? PreviewSize(ORIENT_IS_SWAP(orient) ? w : h) : 0;
+    /* Inverse of CellEdge. Points above or left of the controls stay outside. */
+    const int ux = mx < 0 ? -1 : (int64_t)mx * UI_BASE / scale;
+    const int uy = my < top ? -1 : (int64_t)(my - top) * UI_BASE / scale;
+
     /* Find the mouse position */
     if( p_sys->b_visible )
     {
@@ -427,9 +457,7 @@ static int Mouse( filter_t *p_filter, vlc_mouse_t *p_mouse, const vlc_mouse_t *p
                 b_grab = true;
             }
         }
-        else if( mx >= 0 && mx < 80 &&
-                 my >= i_visu_height &&
-                 my <  i_visu_height + 9 )
+        else if( ux >= 0 && ux < 80 && uy >= 0 && uy < 9 )
         {
             /* Hide text */
             if( b_click )
@@ -438,13 +466,12 @@ static int Mouse( filter_t *p_filter, vlc_mouse_t *p_mouse, const vlc_mouse_t *p
                 b_grab = true;
             }
         }
-        else if( my >= i_visu_height + 9 && my <= i_visu_height + 89 &&
-                 mx >= 0 && mx <= GaugeWidth(my - i_visu_height - 9) )
+        else if( uy >= 9 && uy <= 89 && ux >= 0 && ux <= 40 )
         {
             /* Zoom gauge */
             if( b_pressed )
             {
-                p_sys->i_zoom = GaugeZoom(my - i_visu_height - 9);
+                p_sys->i_zoom = GaugeZoom(uy - 9);
 
                 const int v_w = p_fmt->i_visible_width  * ZOOM_FACTOR / p_sys->i_zoom;
                 const int v_h = p_fmt->i_visible_height * ZOOM_FACTOR / p_sys->i_zoom;
@@ -457,8 +484,7 @@ static int Mouse( filter_t *p_filter, vlc_mouse_t *p_mouse, const vlc_mouse_t *p
     }
     else
     {
-        if( mx >= 0 && mx <  80 &&
-            my >= 0 && my <= 10 )
+        if( ux >= 0 && ux < 80 && uy >= 0 && uy <= 10 )
         {
             /* Show text */
             if( b_click )

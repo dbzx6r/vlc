@@ -1,0 +1,49 @@
+name: Portable Windows zoom test
+on:
+  push:
+    branches: [windows-3.0.24-zoom]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Build with the VideoLAN 3.0.24 Win64 toolchain
+        run: |
+          docker run --rm -v "$PWD:/vlc" -w /vlc \
+            -e VLC_PREBUILT_CONTRIBS_URL=https://artifacts.videolan.org/vlc-3.0/win64/vlc-contrib-x86_64-w64-mingw32-910cc9cada6080dd777fbafb2ebdd0c24f702c30.tar.zst \
+            --user 0:0 --entrypoint /bin/bash registry.videolan.org/vlc-debian-win64-3.0:20260820114402 \
+            -ec 'git config --global --add safe.directory /vlc; extras/package/win32/build.sh -r -i portable -p; make -C win64 package-win32-zip'
+          cp win64/vlc-*-win64.zip vlc-3.0.24-zoom-test-win64.zip
+          unzip -tq vlc-3.0.24-zoom-test-win64.zip
+          unzip -Z1 vlc-3.0.24-zoom-test-win64.zip | grep -Fx 'vlc-3.0.24/vlc.exe'
+          sha256sum vlc-3.0.24-zoom-test-win64.zip > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: portable-vlc-zoom-win64
+          path: |
+            vlc-3.0.24-zoom-test-win64.zip
+            SHA256SUMS
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: portable-vlc-zoom-win64
+      - name: Publish portable test build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha256sum -c SHA256SUMS
+          gh release create "zoom-test-$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title 'VLC 3.0.24 – Windows interactive zoom test (x64)' \
+            --notes 'Unofficial unsigned portable test build. Extract the ZIP into a new folder, close other VLC instances, and launch the extracted vlc.exe. No installation or replacement of stock VLC required.' \
+            vlc-3.0.24-zoom-test-win64.zip SHA256SUMS

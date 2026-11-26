@@ -233,7 +233,8 @@ void UpdateRects(vout_display_t *vd,
 #if !VLC_WINSTORE_APP
     if (likely(sys->event)) // internal rendering
     {
-        EventThreadUpdateSourceAndPlace(sys->event, source, &place);
+        /* Mouse events address the source picture, not an upscaled texture. */
+        EventThreadUpdateSourceAndPlace(sys->event, &vd->source, &place);
 
         if (sys->hvideownd)
             SetWindowPos(sys->hvideownd, 0,

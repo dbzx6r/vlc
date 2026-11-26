@@ -252,11 +252,36 @@ static void *EventThread( void *p_this )
                     place.x = 0;
                     place.y = 0;
                 }
-                const int x = source.i_x_offset +
-                    (int64_t)(GET_X_LPARAM(msg.lParam) - place.x) * source.i_width  / place.width;
-                const int y = source.i_y_offset +
-                    (int64_t)(GET_Y_LPARAM(msg.lParam) - place.y) * source.i_height / place.height;
-                vout_display_SendEventMouseMoved(vd, x, y);
+                /* Undo display orientation before sending picture coordinates
+                 * to interactive filters. Scale only the visible rectangle. */
+                const int w = source.i_visible_width, h = source.i_visible_height;
+                const bool swap = ORIENT_IS_SWAP(source.orientation);
+                const int dx = (int64_t)(GET_X_LPARAM(msg.lParam) - place.x)
+                             * (swap ? h : w) / place.width;
+                const int dy = (int64_t)(GET_Y_LPARAM(msg.lParam) - place.y)
+                             * (swap ? w : h) / place.height;
+                int x = swap ? dy : dx;
+                int y = swap ? dx : dy;
+                switch (source.orientation)
+                {
+                    case ORIENT_HFLIPPED:
+                    case ORIENT_ROTATED_270:
+                        x = w - 1 - x;
+                        break;
+                    case ORIENT_VFLIPPED:
+                    case ORIENT_ROTATED_90:
+                        y = h - 1 - y;
+                        break;
+                    case ORIENT_ROTATED_180:
+                    case ORIENT_ANTI_TRANSPOSED:
+                        x = w - 1 - x;
+                        y = h - 1 - y;
+                        break;
+                    default:
+                        break;
+                }
+                vout_display_SendEventMouseMoved(vd, x + source.i_x_offset,
+                                                 y + source.i_y_offset);
             }
             break;
         case WM_NCMOUSEMOVE:

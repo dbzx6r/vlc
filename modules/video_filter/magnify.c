@@ -63,8 +63,8 @@ static picture_t *Filter( filter_t *, picture_t * );
 static int Mouse( filter_t *, vlc_mouse_t *, const vlc_mouse_t *, const vlc_mouse_t * );
 
 /* */
-static void DrawZoomStatus( uint8_t *, int i_pitch, int i_width, int i_height,
-                            int i_offset_x, int i_offset_y, bool b_visible );
+static void DrawZoomStatus( plane_t *, video_orientation_t,
+                            int scale, int top, bool b_visible );
 static void DrawRectangle( uint8_t *, int i_pitch, int i_width, int i_height,
                            int x, int y, int i_w, int i_h );
 
@@ -85,6 +85,67 @@ struct filter_sys_t
 
 #define VIS_ZOOM 4
 #define ZOOM_FACTOR 8
+
+/* VLC orientation bits describe source-axis reflections followed by a transpose.
+ * Work in visual coordinates for the controls, and stored coordinates for the crop. */
+static bool ReverseX(video_orientation_t o)
+{
+    return o == ORIENT_HFLIPPED || o == ORIENT_ROTATED_180 ||
+           o == ORIENT_ROTATED_270 || o == ORIENT_ANTI_TRANSPOSED;
+}
+
+static bool ReverseY(video_orientation_t o)
+{
+    return o == ORIENT_VFLIPPED || o == ORIENT_ROTATED_180 ||
+           o == ORIENT_ROTATED_90 || o == ORIENT_ANTI_TRANSPOSED;
+}
+
+static void Plot(plane_t *p, video_orientation_t o, int x, int y, uint8_t value)
+{
+    if (ORIENT_IS_SWAP(o)) { int tmp = x; x = y; y = tmp; }
+    if (x < 0 || x >= p->i_visible_pitch || y < 0 || y >= p->i_visible_lines)
+        return;
+    if (ReverseX(o)) x = p->i_visible_pitch - 1 - x;
+    if (ReverseY(o)) y = p->i_visible_lines - 1 - y;
+    p->p_pixels[y * (ptrdiff_t)p->i_pitch + x] = value;
+}
+
+static int PreviewSize(int size)
+{
+    return (size / VIS_ZOOM) & ~1;
+}
+
+/* Keep stock proportions for a 720-line picture. For larger pictures
+ * scale with the upright height, just like the quarter-frame preview. */
+#define UI_BASE 720
+static int ControlScale(int width, int height)
+{
+    return __MAX(UI_BASE, __MIN(height, (int64_t)width * UI_BASE / 80));
+}
+
+static int CellEdge(int n, int scale)
+{
+    return ((int64_t)n * scale + UI_BASE - 1) / UI_BASE;
+}
+
+static void PlotCell(plane_t *plane, video_orientation_t orient, int scale,
+                     int top, int x, int y, uint8_t value)
+{
+    int right = CellEdge(x + 1, scale), bottom = CellEdge(y + 1, scale);
+    for (int py = CellEdge(y, scale); py < bottom; ++py)
+        for (int px = CellEdge(x, scale); px < right; ++px)
+            Plot(plane, orient, px, top + py, value);
+}
+
+static int GaugeWidth(int row)
+{
+    return __MAX(1, (80 - row) * (80 - row) / 160);
+}
+
+static int GaugeZoom(int row)
+{
+    return __MAX(ZOOM_FACTOR, (73 - row) * ZOOM_FACTOR / 10);
+}
 
 /*****************************************************************************
  * Create:
@@ -214,6 +275,7 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
     }
 
     /* */
+    const video_orientation_t orient = p_filter->fmt_out.video.orientation;
     p_oyp = &p_outpic->p[Y_PLANE];
     if( b_visible )
     {
@@ -221,8 +283,8 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
 
         /* image visualization */
         fmt_out = p_filter->fmt_out.video;
-        fmt_out.i_width  = fmt_out.i_visible_width  = (fmt_out.i_visible_width /VIS_ZOOM) & ~1;
-        fmt_out.i_height = fmt_out.i_visible_height = (fmt_out.i_visible_height/VIS_ZOOM) & ~1;
+        fmt_out.i_width  = fmt_out.i_visible_width  = PreviewSize(fmt_out.i_visible_width);
+        fmt_out.i_height = fmt_out.i_visible_height = PreviewSize(fmt_out.i_visible_height);
         p_converted = image_Convert( p_sys->p_image, p_pic,
                                      &p_pic->format, &fmt_out );
         if (unlikely(!p_converted))
@@ -231,8 +293,21 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
             return NULL;
         }
 
-        /* It will put only what can be copied at the top left */
-        picture_CopyVisiblePixels( p_outpic, p_converted );
+        /* Move the thumbnail, without rotating its pixels a second time. */
+        for (int i = 0; i < p_converted->i_planes; ++i) {
+            plane_t dst = p_outpic->p[i];
+            const plane_t *src = &p_converted->p[i];
+            dst.i_visible_pitch = __MIN(dst.i_visible_pitch, src->i_visible_pitch);
+            dst.i_visible_lines = __MIN(dst.i_visible_lines, src->i_visible_lines);
+            if (ReverseX(orient))
+                dst.p_pixels += p_outpic->p[i].i_visible_pitch - dst.i_visible_pitch;
+            if (ReverseY(orient))
+                dst.p_pixels += (ptrdiff_t)dst.i_pitch *
+                                (p_outpic->p[i].i_visible_lines - dst.i_visible_lines);
+            for (int row = 0; row < dst.i_visible_lines; ++row)
+                memcpy(dst.p_pixels + (ptrdiff_t)row * dst.i_pitch,
+                       src->p_pixels + (ptrdiff_t)row * src->i_pitch, dst.i_visible_pitch);
+        }
 
         picture_Release( p_converted );
 
@@ -242,48 +317,43 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
 
         DrawRectangle( p_oyp->p_pixels, p_oyp->i_pitch,
                        p_oyp->i_visible_pitch, p_oyp->i_visible_lines,
-                       o_x/VIS_ZOOM, o_y/VIS_ZOOM,
+                       (ReverseX(orient) ? p_oyp->i_visible_pitch - (int)fmt_out.i_visible_width : 0) + o_x/VIS_ZOOM,
+                       (ReverseY(orient) ? p_oyp->i_visible_lines - (int)fmt_out.i_visible_height : 0) + o_y/VIS_ZOOM,
                        v_w, v_h );
 
         /* */
-        v_h = fmt_out.i_visible_height + 1;
+        v_h = (ORIENT_IS_SWAP(orient) ? fmt_out.i_visible_width : fmt_out.i_visible_height);
     }
     else
     {
-        v_h = 1;
+        v_h = 0;
     }
 
-    /* print a small "VLC ZOOM" */
+    const int w = p_filter->fmt_out.video.i_visible_width;
+    const int h = p_filter->fmt_out.video.i_visible_height;
+    const int scale = ORIENT_IS_SWAP(orient) ? ControlScale(h, w) : ControlScale(w, h);
 
     if( b_visible || p_sys->i_last_activity + p_sys->i_hide_timeout > mdate() )
-        DrawZoomStatus( p_oyp->p_pixels, p_oyp->i_visible_pitch, p_oyp->i_pitch, p_oyp->i_lines,
-                        1, v_h, b_visible );
+        DrawZoomStatus( p_oyp, orient,
+                        scale, v_h, b_visible );
 
     if( b_visible )
     {
-        /* zoom gauge */
-        memset( p_oyp->p_pixels + (v_h+9)*p_oyp->i_pitch, 0xff, 41 );
-        for( int y = v_h + 10; y < v_h + 90; y++ )
-        {
-            int i_width = v_h + 90 - y;
-            i_width = i_width * i_width / 160;
-            if( (80 - y + v_h)*ZOOM_FACTOR/10 < o_zoom )
-            {
-                memset( p_oyp->p_pixels + y*p_oyp->i_pitch, 0xff, i_width );
-            }
-            else
-            {
-                p_oyp->p_pixels[y*p_oyp->i_pitch] = 0xff;
-                p_oyp->p_pixels[y*p_oyp->i_pitch + i_width - 1] = 0xff;
-            }
+        /* Paint a contrasting track so the gauge remains visible on bright video. */
+        for (int row = 0; row <= 80; ++row) {
+            int width = GaugeWidth(row);
+            for (int x = 0; x <= width; ++x)
+                PlotCell(p_oyp, orient, scale, v_h, x, 9 + row,
+                     x == 0 || x == width || row == 0 ? 128 :
+                     (GaugeZoom(row) <= o_zoom ? 235 : 16));
         }
     }
 
     return CopyInfoAndRelease( p_outpic, p_pic );
 }
 
-static void DrawZoomStatus( uint8_t *pb_dst, int i_pitch, int i_width, int i_height,
-                            int i_offset_x, int i_offset_y, bool b_visible )
+static void DrawZoomStatus( plane_t *plane, video_orientation_t orient,
+                            int scale, int top, bool b_visible )
 {
     static const char *p_hide =
         "X   X X      XXXX   XXXXX  XXX   XXX  XX XX   X   X XXXXX XXXX  XXXXXL"
@@ -299,12 +369,11 @@ static void DrawZoomStatus( uint8_t *pb_dst, int i_pitch, int i_width, int i_hei
         "  X   XXXXX  XXXX   XXXXX  XXX   XXX  X   X   XXXX  X   X  XXX   X X L";
     const char *p_draw = b_visible ? p_hide : p_show;
 
-    for( int i = 0, x = i_offset_x, y = i_offset_y; p_draw[i] != '\0'; i++ )
+    for( int i = 0, x = 1, y = 1; p_draw[i] != '\0'; i++ )
     {
         if( p_draw[i] == 'X' )
         {
-            if( x < i_width && y < i_height )
-                pb_dst[y*i_pitch + x] = 0xff;
+            PlotCell(plane, orient, scale, top, x, y, 235);
             x++;
         }
         else if( p_draw[i] == ' ' )
@@ -313,7 +382,7 @@ static void DrawZoomStatus( uint8_t *pb_dst, int i_pitch, int i_width, int i_hei
         }
         else if( p_draw[i] == 'L' )
         {
-            x = i_offset_x;
+            x = 1;
             y++;
         }
     }
@@ -321,7 +390,8 @@ static void DrawZoomStatus( uint8_t *pb_dst, int i_pitch, int i_width, int i_hei
 static void DrawRectangle( uint8_t *pb_dst, int i_pitch, int i_width, int i_height,
                            int x, int y, int i_w, int i_h )
 {
-    if( x + i_w > i_width || y + i_h > i_height )
+    if( i_w <= 0 || i_h <= 0 || x < 0 || y < 0 ||
+        x + i_w > i_width || y + i_h > i_height )
         return;
 
     /* top line */
@@ -349,14 +419,29 @@ static int Mouse( filter_t *p_filter, vlc_mouse_t *p_mouse, const vlc_mouse_t *p
 
     bool b_grab = false;
 
+    const video_orientation_t orient = p_fmt->orientation;
+    const int w = p_fmt->i_visible_width, h = p_fmt->i_visible_height;
+    const int sx = p_new->i_x - (int)p_fmt->i_x_offset;
+    const int sy = p_new->i_y - (int)p_fmt->i_y_offset;
+    const int rx = ReverseX(orient) ? w - 1 - sx : sx;
+    const int ry = ReverseY(orient) ? h - 1 - sy : sy;
+    const int mx = ORIENT_IS_SWAP(orient) ? ry : rx;
+    const int my = ORIENT_IS_SWAP(orient) ? rx : ry;
+
+    const int scale = ORIENT_IS_SWAP(orient) ? ControlScale(h, w) : ControlScale(w, h);
+    const int top = p_sys->b_visible ? PreviewSize(ORIENT_IS_SWAP(orient) ? w : h) : 0;
+    /* Inverse of CellEdge. Points above or left of the controls stay outside. */
+    const int ux = mx < 0 ? -1 : (int64_t)mx * UI_BASE / scale;
+    const int uy = my < top ? -1 : (int64_t)(my - top) * UI_BASE / scale;
+
     /* Find the mouse position */
     if( p_sys->b_visible )
     {
-        const int i_visu_width  = p_fmt->i_visible_width  / VIS_ZOOM;
-        const int i_visu_height = p_fmt->i_visible_height / VIS_ZOOM;
+        const int i_visu_width  = PreviewSize(ORIENT_IS_SWAP(orient) ? h : w);
+        const int i_visu_height = PreviewSize(ORIENT_IS_SWAP(orient) ? w : h);
 
-        if( p_new->i_x >= 0 && p_new->i_x < i_visu_width &&
-            p_new->i_y >= 0 && p_new->i_y < i_visu_height )
+        if( mx >= 0 && mx < i_visu_width &&
+            my >= 0 && my < i_visu_height )
         {
             /* Visualization */
             if( b_pressed )
@@ -364,17 +449,15 @@ static int Mouse( filter_t *p_filter, vlc_mouse_t *p_mouse, const vlc_mouse_t *p
                 const int v_w = p_fmt->i_visible_width  * ZOOM_FACTOR / p_sys->i_zoom;
                 const int v_h = p_fmt->i_visible_height * ZOOM_FACTOR / p_sys->i_zoom;
 
-                p_sys->i_x = VLC_CLIP( p_new->i_x * VIS_ZOOM - v_w/2, 0,
-                                           (int)p_fmt->i_visible_width  - v_w - 1);
-                p_sys->i_y = VLC_CLIP( p_new->i_y * VIS_ZOOM - v_h/2, 0,
-                                           (int)p_fmt->i_visible_height - v_h - 1);
+                p_sys->i_x = VLC_CLIP( (sx - (ReverseX(orient) ? w - PreviewSize(w) : 0)) * VIS_ZOOM - v_w/2, 0,
+                                           (int)p_fmt->i_visible_width  - v_w);
+                p_sys->i_y = VLC_CLIP( (sy - (ReverseY(orient) ? h - PreviewSize(h) : 0)) * VIS_ZOOM - v_h/2, 0,
+                                           (int)p_fmt->i_visible_height - v_h);
 
                 b_grab = true;
             }
         }
-        else if( p_new->i_x >= 0 && p_new->i_x < 80 &&
-                 p_new->i_y >= i_visu_height &&
-                 p_new->i_y <  i_visu_height + 9 )
+        else if( ux >= 0 && ux < 80 && uy >= 0 && uy < 9 )
         {
             /* Hide text */
             if( b_click )
@@ -383,23 +466,17 @@ static int Mouse( filter_t *p_filter, vlc_mouse_t *p_mouse, const vlc_mouse_t *p
                 b_grab = true;
             }
         }
-        else if( p_new->i_x >= 0 &&
-                 p_new->i_x <= ( i_visu_height + 90 - p_new->i_y ) *
-                               ( i_visu_height + 90 - p_new->i_y ) / 160 &&
-                 p_new->i_y >= i_visu_height + 9 &&
-                 p_new->i_y <= i_visu_height + 90 )
+        else if( uy >= 9 && uy <= 89 && ux >= 0 && ux <= 40 )
         {
             /* Zoom gauge */
             if( b_pressed )
             {
-                p_sys->i_zoom = __MAX( ZOOM_FACTOR,
-                                       (80 + i_visu_height - p_new->i_y + 2) *
-                                           ZOOM_FACTOR / 10 );
+                p_sys->i_zoom = GaugeZoom(uy - 9);
 
                 const int v_w = p_fmt->i_visible_width  * ZOOM_FACTOR / p_sys->i_zoom;
                 const int v_h = p_fmt->i_visible_height * ZOOM_FACTOR / p_sys->i_zoom;
-                p_sys->i_x = VLC_CLIP( p_sys->i_x, 0, (int)p_fmt->i_visible_width  - v_w - 1 );
-                p_sys->i_y = VLC_CLIP( p_sys->i_y, 0, (int)p_fmt->i_visible_height - v_h - 1 );
+                p_sys->i_x = VLC_CLIP( p_sys->i_x, 0, (int)p_fmt->i_visible_width  - v_w );
+                p_sys->i_y = VLC_CLIP( p_sys->i_y, 0, (int)p_fmt->i_visible_height - v_h );
 
                 b_grab = true;
             }
@@ -407,8 +484,7 @@ static int Mouse( filter_t *p_filter, vlc_mouse_t *p_mouse, const vlc_mouse_t *p
     }
     else
     {
-        if( p_new->i_x >= 0 && p_new->i_x <  80 &&
-            p_new->i_y >= 0 && p_new->i_y <= 10 )
+        if( ux >= 0 && ux < 80 && uy >= 0 && uy <= 10 )
         {
             /* Show text */
             if( b_click )
